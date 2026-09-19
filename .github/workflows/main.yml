@@ -9,355 +9,366 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-
-      # ============================================================
-      # RDP + AUDIO CONFIGURATION
-      # ============================================================
-
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
           # Enable Remote Desktop
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
+            -Name 'fDenyTSConnections' `
             -Value 0 `
             -Force
 
-          # RDP authentication settings
+          # Kept from the original script.
+          # WARNING: NLA/SecurityLayer=0 reduces RDP security.
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
+            -Name 'UserAuthentication' `
             -Value 0 `
             -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" `
+            -Name 'SecurityLayer' `
             -Value 0 `
             -Force
 
-          # ========================================================
-          # RDP AUDIO PLAYBACK
-          # ========================================================
-
+          # RDP audio playback + microphone/audio capture
           $tsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-
           if (-not (Test-Path $tsPolicy)) {
               New-Item -Path $tsPolicy -Force | Out-Null
           }
 
-          # Enable audio playback through RDP
           New-ItemProperty `
             -Path $tsPolicy `
-            -Name "fDisableAudioPlayback" `
+            -Name 'fDisableAudioPlayback' `
             -PropertyType DWord `
             -Value 0 `
             -Force | Out-Null
 
-          # Enable microphone/audio capture through RDP
           New-ItemProperty `
             -Path $tsPolicy `
-            -Name "fDisableAudioCapture" `
+            -Name 'fDisableAudioCapture' `
             -PropertyType DWord `
             -Value 0 `
             -Force | Out-Null
 
-          # ========================================================
-          # WINDOWS AUDIO SERVICES
-          # ========================================================
+          # Windows Audio services
+          Set-Service -Name 'AudioEndpointBuilder' -StartupType Automatic
+          Set-Service -Name 'Audiosrv' -StartupType Automatic
+          Start-Service -Name 'AudioEndpointBuilder' -ErrorAction SilentlyContinue
+          Start-Service -Name 'Audiosrv' -ErrorAction SilentlyContinue
 
-          Set-Service `
-            -Name "Audiosrv" `
-            -StartupType Automatic
-
-          Start-Service `
-            -Name "Audiosrv" `
-            -ErrorAction SilentlyContinue
-
-          Set-Service `
-            -Name "AudioEndpointBuilder" `
-            -StartupType Automatic
-
-          Start-Service `
-            -Name "AudioEndpointBuilder" `
-            -ErrorAction SilentlyContinue
-
-          # ========================================================
-          # FIREWALL
-          # ========================================================
-
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-
+          # Allow RDP only from the Tailscale CGNAT range.
+          netsh advfirewall firewall delete rule name='RDP-Tailscale'
           netsh advfirewall firewall add rule `
-            name="RDP-Tailscale" `
+            name='RDP-Tailscale' `
             dir=in `
             action=allow `
             protocol=TCP `
-            localport=3389
+            localport=3389 `
+            remoteip=100.64.0.0/10
 
-          # Restart RDP service
-          Restart-Service `
-            -Name TermService `
-            -Force
+          Restart-Service -Name 'TermService' -Force
 
-          Write-Host "RDP enabled."
-          Write-Host "RDP audio playback enabled."
-          Write-Host "RDP microphone redirection enabled."
-          Write-Host "Windows Audio services enabled."
-
-
-      # ============================================================
-      # CREATE RDP USER
-      # ============================================================
+          Write-Host 'RDP configured.'
+          Write-Host 'RDP audio playback enabled.'
+          Write-Host 'RDP audio capture enabled.'
 
       - name: Create RDP User with Secure Password
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          Add-Type -AssemblyName System.Security
+          $existing = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          if ($existing) {
+              Remove-LocalUser -Name 'RDP'
+          }
 
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
               Number  = [char[]](48..57)
-              Special = (
-                  [char[]](33..47) +
-                  [char[]](58..64) +
-                  [char[]](91..96) +
-                  [char[]](123..126)
-              )
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
 
           $rawPassword = @()
-
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
-
           $password = -join ($rawPassword | Sort-Object { Get-Random })
 
-          $securePass = ConvertTo-SecureString `
-            $password `
-            -AsPlainText `
-            -Force
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
           New-LocalUser `
-            -Name "RDP" `
+            -Name 'RDP' `
             -Password $securePass `
-            -AccountNeverExpires
+            -AccountNeverExpires `
+            -PasswordNeverExpires $true
 
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "RDP"
+          Add-LocalGroupMember -Group 'Administrators' -Member 'RDP'
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP'
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "RDP"
+          "RDP_CREDS=User: RDP | Password: $password" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed."
+          if (-not (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue)) {
+              Write-Error 'User creation failed.'
               exit 1
           }
 
-          Write-Host "RDP user created successfully."
-
-
-      # ============================================================
-      # INSTALL TAILSCALE
-      # ============================================================
+          Write-Host 'RDP user created successfully.'
 
       - name: Install Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          # Current stable 64-bit Windows MSI from Tailscale's stable package index.
+          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.102.4-amd64.msi'
+          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
 
-          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
 
-          Invoke-WebRequest `
-            -Uri $tsUrl `
-            -OutFile $installerPath
+          $proc = Start-Process `
+            -FilePath 'msiexec.exe' `
+            -ArgumentList '/i', $installerPath, '/quiet', '/norestart' `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
 
-          Start-Process `
-            msiexec.exe `
-            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait
-
-          Remove-Item `
-            $installerPath `
-            -Force
-
-          Write-Host "Tailscale installed successfully."
-
-
-      # ============================================================
-      # CONNECT TAILSCALE
-      # ============================================================
-
-      - name: Establish Tailscale Connection
-        shell: powershell
-        run: |
-
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $tailscale up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          $tsIP = $null
-          $retries = 0
-
-          while (-not $tsIP -and $retries -lt 10) {
-
-              $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
-
-              if (-not $tsIP) {
-                  Start-Sleep -Seconds 5
-              }
-
-              $retries++
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP was not assigned."
+          if ($proc.ExitCode -notin @(0, 3010)) {
+              Write-Error "Tailscale installation failed. Exit code: $($proc.ExitCode)"
               exit 1
           }
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tailscale)) {
+              Write-Error 'Tailscale installation failed.'
+              exit 1
+          }
+
+          Write-Host 'Tailscale installed successfully.'
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
+              Write-Error 'TAILSCALE_AUTH_KEY secret is missing.'
+              exit 1
+          }
+
+          & $tailscale up `
+            --authkey=$env:TS_AUTH_KEY `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 20 -and -not $tsIP; $i++) {
+              $candidate = (& $tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+
+              if ($candidate -match '^100\.\d+\.\d+\.\d+$') {
+                  $tsIP = $candidate
+                  break
+              }
+
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $tsIP) {
+              Write-Error 'Tailscale IP was not assigned.'
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Tailscale IP: $tsIP"
-
-
-      # ============================================================
-      # INSTALL ANYDESK
-      # ============================================================
 
       - name: Install AnyDesk
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "Installing AnyDesk..."
+          $installer = Join-Path $env:TEMP 'AnyDesk.exe'
+          $installDir = 'C:\Program Files (x86)\AnyDesk'
+          $anydesk = Join-Path $installDir 'AnyDesk.exe'
 
-          winget install `
-            --id AnyDeskSoftwareGmbH.AnyDesk `
-            --exact `
-            --silent `
-            --accept-package-agreements `
-            --accept-source-agreements
+          # Official AnyDesk Windows executable.
+          Invoke-WebRequest `
+            -Uri 'https://download.anydesk.com/AnyDesk.exe' `
+            -OutFile $installer `
+            -UseBasicParsing
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "AnyDesk installation failed."
+          if (-not (Test-Path $installer)) {
+              Write-Error 'AnyDesk download failed.'
               exit 1
           }
 
-          Write-Host "AnyDesk installed successfully."
+          $proc = Start-Process `
+            -FilePath $installer `
+            -ArgumentList '--install', $installDir, '--start-with-win', '--silent' `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
 
+          if ($proc.ExitCode -ne 0) {
+              Write-Error "AnyDesk installation failed. Exit code: $($proc.ExitCode)"
+              exit 1
+          }
 
-      # ============================================================
-      # INSTALL VISUAL STUDIO CODE
-      # ============================================================
+          if (-not (Test-Path $anydesk)) {
+              Write-Error 'AnyDesk.exe was not found after installation.'
+              exit 1
+          }
+
+          & $anydesk --version
+          Write-Host 'AnyDesk installed successfully.'
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
       - name: Install Visual Studio Code
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "Installing Visual Studio Code..."
+          $installer = Join-Path $env:TEMP 'VSCodeSetup.exe'
 
-          winget install `
-            --id Microsoft.VisualStudioCode `
-            --exact `
-            --silent `
-            --accept-package-agreements `
-            --accept-source-agreements
+          # Official Microsoft Visual Studio Code stable x64 System installer.
+          Invoke-WebRequest `
+            -Uri 'https://update.code.visualstudio.com/latest/win32-x64/stable' `
+            -OutFile $installer `
+            -UseBasicParsing
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Visual Studio Code installation failed."
+          if (-not (Test-Path $installer)) {
+              Write-Error 'VS Code download failed.'
               exit 1
           }
 
-          Write-Host "Visual Studio Code installed successfully."
+          $proc = Start-Process `
+            -FilePath $installer `
+            -ArgumentList '/VERYSILENT', '/NORESTART', '/MERGETASKS=!runcode' `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
 
+          if ($proc.ExitCode -ne 0) {
+              Write-Error "VS Code installation failed. Exit code: $($proc.ExitCode)"
+              exit 1
+          }
 
-      # ============================================================
-      # INSTALL OBS STUDIO
-      # ============================================================
+          $codePaths = @(
+              'C:\Program Files\Microsoft VS Code\Code.exe',
+              "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
+          )
+
+          $code = $codePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $code) {
+              Write-Error 'VS Code executable was not found after installation.'
+              exit 1
+          }
+
+          Write-Host "VS Code installed at: $code"
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
       - name: Install OBS Studio
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "Installing OBS Studio..."
+          $installer = Join-Path $env:TEMP 'OBS-Studio-Setup.exe'
 
-          winget install `
-            --id OBSProject.OBSStudio `
-            --exact `
-            --silent `
-            --accept-package-agreements `
-            --accept-source-agreements
+          # Official OBS Studio 32.2.2 Windows x64 installer.
+          Invoke-WebRequest `
+            -Uri 'https://github.com/obsproject/obs-studio/releases/download/32.2.2/OBS-Studio-32.2.2-Windows-x64-Installer.exe' `
+            -OutFile $installer `
+            -UseBasicParsing
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "OBS Studio installation failed."
+          if (-not (Test-Path $installer)) {
+              Write-Error 'OBS Studio download failed.'
               exit 1
           }
 
-          Write-Host "OBS Studio installed successfully."
+          $proc = Start-Process `
+            -FilePath $installer `
+            -ArgumentList '/S' `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
 
+          if ($proc.ExitCode -ne 0) {
+              Write-Error "OBS Studio installation failed. Exit code: $($proc.ExitCode)"
+              exit 1
+          }
 
-      # ============================================================
-      # VERIFY RDP
-      # ============================================================
+          $obsPaths = @(
+              'C:\Program Files\obs-studio\bin\64bit\obs64.exe',
+              'C:\Program Files\obs-studio\bin\64bit\obs64.exe'
+          )
+
+          $obs = $obsPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $obs) {
+              Write-Error 'OBS Studio executable was not found after installation.'
+              exit 1
+          }
+
+          Write-Host "OBS Studio installed at: $obs"
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
 
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
           $testResult = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
-            -Port 3389
+            -Port 3389 `
+            -WarningAction SilentlyContinue
 
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed."
+              Write-Error 'TCP connection to RDP port 3389 failed.'
               exit 1
           }
 
-          Write-Host "TCP connectivity successful."
-
-
-      # ============================================================
-      # SHOW ACCESS INFORMATION + KEEP RUNNER ALIVE
-      # ============================================================
+          Write-Host 'TCP connectivity successful.'
 
       - name: Maintain Connection
         shell: powershell
         run: |
-
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "             RDP ACCESS"
-          Write-Host "=========================================="
+          Write-Host ''
+          Write-Host '=========================================='
+          Write-Host '              RDP ACCESS'
+          Write-Host '=========================================='
           Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
+          Write-Host 'Port    : 3389'
+          Write-Host 'Username: RDP'
           Write-Host "Password: $env:RDP_CREDS"
-          Write-Host ""
-          Write-Host "Installed:"
-          Write-Host " - Tailscale"
-          Write-Host " - AnyDesk"
-          Write-Host " - Visual Studio Code"
-          Write-Host " - OBS Studio"
-          Write-Host " - RDP Audio"
-          Write-Host "=========================================="
-          Write-Host ""
+          Write-Host ''
+          Write-Host 'Installed:'
+          Write-Host ' - Tailscale'
+          Write-Host ' - AnyDesk'
+          Write-Host ' - Visual Studio Code'
+          Write-Host ' - OBS Studio'
+          Write-Host ' - RDP Audio'
+          Write-Host '=========================================='
+          Write-Host ''
 
           while ($true) {
-
               Write-Host "[$(Get-Date)] RDP Active"
-
               Start-Sleep -Seconds 300
           }
