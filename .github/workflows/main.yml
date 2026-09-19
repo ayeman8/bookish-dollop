@@ -6,592 +6,109 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-
-      # ============================================================
-      # RDP + AUDIO
-      # ============================================================
-
       - name: Configure Core RDP Settings
-        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          Write-Host "Configuring Remote Desktop..."
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          # Enable Remote Desktop
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0 `
-            -Force
-
-          # Keep original RDP configuration
-          # NOTE: This disables NLA and SecurityLayer.
-          # Access is restricted by the Tailscale firewall rule below.
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Value 0 `
-            -Force
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' `
-            -Value 0 `
-            -Force
-
-          # ========================================================
-          # RDP AUDIO PLAYBACK + AUDIO CAPTURE
-          # ========================================================
-
-          $tsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-
-          if (-not (Test-Path $tsPolicy)) {
-              New-Item `
-                -Path $tsPolicy `
-                -Force | Out-Null
-          }
-
-          # Allow audio playback from Windows to RDP client
-          New-ItemProperty `
-            -Path $tsPolicy `
-            -Name 'fDisableAudioPlayback' `
-            -PropertyType DWord `
-            -Value 0 `
-            -Force | Out-Null
-
-          # Allow audio capture/microphone redirection
-          New-ItemProperty `
-            -Path $tsPolicy `
-            -Name 'fDisableAudioCapture' `
-            -PropertyType DWord `
-            -Value 0 `
-            -Force | Out-Null
-
-          # ========================================================
-          # WINDOWS AUDIO SERVICES
-          # ========================================================
-
-          Set-Service `
-            -Name 'AudioEndpointBuilder' `
-            -StartupType Automatic
-
-          Set-Service `
-            -Name 'Audiosrv' `
-            -StartupType Automatic
-
-          Start-Service `
-            -Name 'AudioEndpointBuilder' `
-            -ErrorAction SilentlyContinue
-
-          Start-Service `
-            -Name 'Audiosrv' `
-            -ErrorAction SilentlyContinue
-
-          # ========================================================
-          # FIREWALL
-          # ========================================================
-
-          # Remove old rule if it exists
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-
-          # Allow RDP only from Tailscale CGNAT range
-          netsh advfirewall firewall add rule `
-            name="RDP-Tailscale" `
-            dir=in `
-            action=allow `
-            protocol=TCP `
-            localport=3389 `
-            remoteip=100.64.0.0/10
-
-          # Restart RDP service
-          Restart-Service `
-            -Name 'TermService' `
-            -Force
-
-          Write-Host "RDP configured successfully."
-          Write-Host "RDP audio playback enabled."
-          Write-Host "RDP audio capture enabled."
-          Write-Host "RDP firewall restricted to Tailscale."
-
-      # ============================================================
-      # CREATE RDP USER
-      # ============================================================
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
-        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Creating RDP user..."
-
-          # Remove old user if it exists
-          $existing = Get-LocalUser `
-            -Name 'RDP' `
-            -ErrorAction SilentlyContinue
-
-          if ($existing) {
-              Write-Host "Existing RDP user found. Removing it..."
-
-              Remove-LocalUser `
-                -Name 'RDP'
-
-              Start-Sleep -Seconds 2
-          }
-
-          # ========================================================
-          # PASSWORD GENERATION
-          # ========================================================
-
+          Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = (
-                  [char[]](33..47) +
-                  [char[]](58..64) +
-                  [char[]](91..96) +
-                  [char[]](123..126)
-              )
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
-
           $rawPassword = @()
-
-          $rawPassword += `
-            $charSet.Upper |
-            Get-Random -Count 4
-
-          $rawPassword += `
-            $charSet.Lower |
-            Get-Random -Count 4
-
-          $rawPassword += `
-            $charSet.Number |
-            Get-Random -Count 4
-
-          $rawPassword += `
-            $charSet.Special |
-            Get-Random -Count 4
-
-          $password = -join (
-              $rawPassword |
-              Sort-Object { Get-Random }
-          )
-
-          $securePass = ConvertTo-SecureString `
-            $password `
-            -AsPlainText `
-            -Force
-
-          # ========================================================
-          # CREATE USER
-          # ========================================================
-
-          New-LocalUser `
-            -Name 'RDP' `
-            -Password $securePass `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
-
-          # Add administrator privileges
-          Add-LocalGroupMember `
-            -Group 'Administrators' `
-            -Member 'RDP'
-
-          # Allow Remote Desktop
-          Add-LocalGroupMember `
-            -Group 'Remote Desktop Users' `
-            -Member 'RDP'
-
-          # ========================================================
-          # VERIFY USER
-          # ========================================================
-
-          $user = Get-LocalUser `
-            -Name 'RDP' `
-            -ErrorAction SilentlyContinue
-
-          if (-not $user) {
-              Write-Error "RDP user creation failed."
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
               exit 1
           }
-
-          # Store credentials for next steps
-          "RDP_CREDS=User: RDP | Password: $password" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-          Write-Host "RDP user created successfully."
-
-      # ============================================================
-      # INSTALL TAILSCALE
-      # ============================================================
 
       - name: Install Tailscale
-        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Installing Tailscale..."
-
-          $tsUrl = `
-            'https://pkgs.tailscale.com/stable/tailscale-setup-1.102.4-amd64.msi'
-
-          $installerPath = `
-            Join-Path $env:TEMP 'tailscale.msi'
-
-          Invoke-WebRequest `
-            -Uri $tsUrl `
-            -OutFile $installerPath `
-            -UseBasicParsing
-
-          if (-not (Test-Path $installerPath)) {
-              Write-Error "Tailscale download failed."
-              exit 1
-          }
-
-          $proc = Start-Process `
-            -FilePath 'msiexec.exe' `
-            -ArgumentList @(
-                '/i',
-                $installerPath,
-                '/quiet',
-                '/norestart'
-            ) `
-            -Wait `
-            -PassThru `
-            -NoNewWindow
-
-          if ($proc.ExitCode -notin @(0, 3010)) {
-              Write-Error `
-                "Tailscale installation failed. Exit code: $($proc.ExitCode)"
-
-              exit 1
-          }
-
-          Remove-Item `
-            $installerPath `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          $tailscale = `
-            Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
-          if (-not (Test-Path $tailscale)) {
-              Write-Error "Tailscale executable was not found."
-              exit 1
-          }
-
-          Write-Host "Tailscale installed successfully."
-
-      # ============================================================
-      # CONNECT TAILSCALE
-      # ============================================================
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
-        shell: powershell
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Connecting to Tailscale..."
-
-          $tailscale = `
-            Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
-          if (-not (Test-Path $tailscale)) {
-              Write-Error "Tailscale executable not found."
-              exit 1
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
-              Write-Error "TAILSCALE_AUTH_KEY secret is missing."
-              exit 1
-          }
-
-          & $tailscale up `
-            --authkey=$env:TS_AUTH_KEY `
-            --hostname="gh-runner-$env:GITHUB_RUN_ID"
-
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale connection failed."
-              exit 1
-          }
-
-          # Wait for IPv4 address
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
-
-          for ($i = 0; $i -lt 20; $i++) {
-
-              $candidate = (
-                  & $tailscale ip -4 2>$null |
-                  Select-Object -First 1
-              ).Trim()
-
-              if ($candidate -match '^100\.\d+\.\d+\.\d+$') {
-                  $tsIP = $candidate
-                  break
-              }
-
-              Start-Sleep -Seconds 3
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
+          
           if (-not $tsIP) {
-              Write-Error "Tailscale IP was not assigned."
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-
-          "TAILSCALE_IP=$tsIP" |
-            Out-File `
-              -FilePath $env:GITHUB_ENV `
-              -Encoding utf8 `
-              -Append
-
-          Write-Host "Tailscale IP: $tsIP"
-
-      # ============================================================
-      # INSTALL ANYDESK
-      # ============================================================
-
-      - name: Install AnyDesk
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Downloading AnyDesk..."
-
-          $installer = `
-            Join-Path $env:TEMP 'AnyDesk.exe'
-
-          $installDir = `
-            'C:\Program Files (x86)\AnyDesk'
-
-          $anydesk = `
-            Join-Path $installDir 'AnyDesk.exe'
-
-          Invoke-WebRequest `
-            -Uri 'https://download.anydesk.com/AnyDesk.exe' `
-            -OutFile $installer `
-            -UseBasicParsing
-
-          if (-not (Test-Path $installer)) {
-              Write-Error "AnyDesk download failed."
-              exit 1
-          }
-
-          Write-Host "Installing AnyDesk..."
-
-          $arguments = `
-            "--install `"$installDir`" --start-with-win --silent"
-
-          $proc = Start-Process `
-            -FilePath $installer `
-            -ArgumentList $arguments `
-            -Wait `
-            -PassThru `
-            -NoNewWindow
-
-          if ($proc.ExitCode -ne 0) {
-              Write-Error `
-                "AnyDesk installation failed. Exit code: $($proc.ExitCode)"
-
-              exit 1
-          }
-
-          Start-Sleep -Seconds 3
-
-          if (-not (Test-Path $anydesk)) {
-              Write-Error "AnyDesk.exe was not found."
-              exit 1
-          }
-
-          Write-Host "AnyDesk installed successfully."
-
-          Remove-Item `
-            $installer `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-      # ============================================================
-      # INSTALL VISUAL STUDIO CODE
-      # ============================================================
-
-      - name: Install Visual Studio Code
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Downloading Visual Studio Code..."
-
-          $installer = `
-            Join-Path $env:TEMP 'VSCodeSetup.exe'
-
-          Invoke-WebRequest `
-            -Uri 'https://update.code.visualstudio.com/latest/win32-x64/stable' `
-            -OutFile $installer `
-            -UseBasicParsing
-
-          if (-not (Test-Path $installer)) {
-              Write-Error "VS Code download failed."
-              exit 1
-          }
-
-          Write-Host "Installing Visual Studio Code..."
-
-          $proc = Start-Process `
-            -FilePath $installer `
-            -ArgumentList @(
-                '/VERYSILENT',
-                '/NORESTART',
-                '/MERGETASKS=!runcode'
-            ) `
-            -Wait `
-            -PassThru `
-            -NoNewWindow
-
-          if ($proc.ExitCode -ne 0) {
-              Write-Error `
-                "VS Code installation failed. Exit code: $($proc.ExitCode)"
-
-              exit 1
-          }
-
-          $codePaths = @(
-              'C:\Program Files\Microsoft VS Code\Code.exe',
-              "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe"
-          )
-
-          $code = `
-            $codePaths |
-            Where-Object { Test-Path $_ } |
-            Select-Object -First 1
-
-          if (-not $code) {
-              Write-Error "VS Code executable was not found."
-              exit 1
-          }
-
-          Write-Host "VS Code installed at: $code"
-
-          Remove-Item `
-            $installer `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-      # ============================================================
-      # INSTALL OBS STUDIO
-      # ============================================================
-
-      - name: Install OBS Studio
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Downloading OBS Studio..."
-
-          $installer = `
-            Join-Path $env:TEMP 'OBS-Studio-Setup.exe'
-
-          Invoke-WebRequest `
-            -Uri 'https://github.com/obsproject/obs-studio/releases/download/32.2.2/OBS-Studio-32.2.2-Windows-x64-Installer.exe' `
-            -OutFile $installer `
-            -UseBasicParsing
-
-          if (-not (Test-Path $installer)) {
-              Write-Error "OBS Studio download failed."
-              exit 1
-          }
-
-          Write-Host "Installing OBS Studio..."
-
-          $proc = Start-Process `
-            -FilePath $installer `
-            -ArgumentList '/S' `
-            -Wait `
-            -PassThru `
-            -NoNewWindow
-
-          if ($proc.ExitCode -ne 0) {
-              Write-Error `
-                "OBS Studio installation failed. Exit code: $($proc.ExitCode)"
-
-              exit 1
-          }
-
-          $obs = `
-            'C:\Program Files\obs-studio\bin\64bit\obs64.exe'
-
-          if (-not (Test-Path $obs)) {
-              Write-Error "OBS Studio executable was not found."
-              exit 1
-          }
-
-          Write-Host "OBS Studio installed successfully."
-
-          Remove-Item `
-            $installer `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-      # ============================================================
-      # VERIFY RDP
-      # ============================================================
-
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
       - name: Verify RDP Accessibility
-        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host "Testing RDP..."
-
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-          $testResult = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error `
-                "TCP connection to RDP port 3389 failed."
-
+              Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-
-          Write-Host "TCP connectivity successful."
-
-      # ============================================================
-      # KEEP RUNNER ALIVE
-      # ============================================================
+          Write-Host "TCP connectivity successful!"
 
       - name: Maintain Connection
-        shell: powershell
         run: |
-          Write-Host ''
-          Write-Host '=========================================='
-          Write-Host '              RDP ACCESS'
-          Write-Host '=========================================='
-          Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host 'Port    : 3389'
-          Write-Host 'Username: RDP'
-          Write-Host "Password: $env:RDP_CREDS"
-          Write-Host ''
-          Write-Host 'Installed applications:'
-          Write-Host ' - Tailscale'
-          Write-Host ' - AnyDesk'
-          Write-Host ' - Visual Studio Code'
-          Write-Host ' - OBS Studio'
-          Write-Host ' - RDP Audio'
-          Write-Host '=========================================='
-          Write-Host ''
-
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active"
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
+          
